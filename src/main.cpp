@@ -1,15 +1,13 @@
 #include <Arduino.h>
 #include <Wire.h>
-#include <Adafruit_PWMServoDriver.h>
 
+#define PCA9685_ADDR   0x40
 #define TCA_FRONT_ADDR 0x70
 #define TCA_BACK_ADDR  0x71
 #define AS5600_ADDR    0x36
+#define MPU6050_ADDR   0x68 // Default MPU6050 I2C address
 
-Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
-
-// Your exact perfboard leg mappings
-int servo_pins[12] =  {5, 4, 6, 8, 10, 9, 12, 13, 15, 7, 2, 0}; 
+bool mpu_found = false;
 
 void tcaSelect(uint8_t target_tca, uint8_t channel) {
   if (channel > 7) return;
@@ -24,65 +22,105 @@ void tcaSelect(uint8_t target_tca, uint8_t channel) {
   Wire.endTransmission();
 }
 
-uint16_t readAS5600() {
-  Wire.beginTransmission(AS5600_ADDR);
-  Wire.write(0x0E);
-  if (Wire.endTransmission(false) != 0) return 0xFFFF; 
-  
-  Wire.requestFrom((uint8_t)AS5600_ADDR, (uint8_t)2);
-  if (Wire.available() == 2) {
-    return (Wire.read() << 8) | Wire.read();
-  }
-  return 0xFFFF; 
+void tcaDisableAll() {
+  Wire.beginTransmission(TCA_FRONT_ADDR);
+  Wire.write(0);
+  Wire.endTransmission();
+  Wire.beginTransmission(TCA_BACK_ADDR);
+  Wire.write(0);
+  Wire.endTransmission();
+}
+
+bool checkDevice(uint8_t address) {
+  Wire.beginTransmission(address);
+  return (Wire.endTransmission() == 0);
+}
+
+void setupMPU6050() {
+  tcaDisableAll(); // Ensure we are talking directly to the main spine
+  Wire.beginTransmission(MPU6050_ADDR);
+  Wire.write(0x6B); // PWR_MGMT_1 register
+  Wire.write(0x00); // Write 0 to wake up the MPU6050
+  Wire.endTransmission();
 }
 
 void setup() {
   Serial.begin(115200);
-  while(!Serial) delay(10);
+  while (!Serial) delay(10);
   
   Wire.begin();
-  Wire.setClock(100000); // Stable I2C for encoders
-  
-  pwm.begin();
-  pwm.setOscillatorFrequency(27000000);
-  pwm.setPWMFreq(50);
+  Wire.setClock(100000); 
 
-  for(int i=0; i<12; i++) pwm.setPWM(servo_pins[i], 0, 375);
+  Serial.println("\n=== V3 PCB DIAGNOSTIC SCANNER ===");
+  Serial.println("Scanning Main I2C Spine...");
+
+  if (checkDevice(PCA9685_ADDR)) Serial.println("[OK] PCA9685 Servo Driver found (0x40)");
+  else Serial.println("[FAIL] PCA9685 missing!");
+
+  if (checkDevice(TCA_FRONT_ADDR)) Serial.println("[OK] Front TCA9548A found (0x70)");
+  else Serial.println("[FAIL] Front TCA missing!");
+
+  if (checkDevice(TCA_BACK_ADDR)) Serial.println("[OK] Back TCA9548A found (0x71)");
+  else Serial.println("[FAIL] Back TCA missing!");
+
+  if (checkDevice(MPU6050_ADDR)) {
+    Serial.println("[OK] MPU6050 IMU found (0x68)");
+    mpu_found = true;
+    setupMPU6050();
+  } else {
+    Serial.println("[FAIL] MPU6050 missing!");
+  }
+
+  Serial.println("\nScanning Encoders (Front TCA - 0x70)...");
+  for (uint8_t ch = 0; ch < 8; ch++) {
+    tcaSelect(TCA_FRONT_ADDR, ch);
+    if (checkDevice(AS5600_ADDR)) {
+      Serial.print("  -> Channel "); Serial.print(ch); Serial.println(": [OK] AS5600 Found");
+    } else {
+      Serial.print("  -> Channel "); Serial.print(ch); Serial.println(": Empty");
+    }
+  }
+
+  Serial.println("\nScanning Encoders (Back TCA - 0x71)...");
+  for (uint8_t ch = 0; ch < 8; ch++) {
+    tcaSelect(TCA_BACK_ADDR, ch);
+    if (checkDevice(AS5600_ADDR)) {
+      Serial.print("  -> Channel "); Serial.print(ch); Serial.println(": [OK] AS5600 Found");
+    } else {
+      Serial.print("  -> Channel "); Serial.print(ch); Serial.println(": Empty");
+    }
+  }
+  
+  Serial.println("\nScan Complete. Starting IMU Readout...\n");
+  delay(2000);
 }
 
 void loop() {
-  // Wait for the target frame from Python
-  if (Serial.available() > 0) {
-    String req = Serial.readStringUntil('\n');
+  if (mpu_found) {
+    tcaDisableAll(); // Isolate the main bus for clean IMU reading
     
-    int pulses[12];
-    int lastIndex = 0;
+    Wire.beginTransmission(MPU6050_ADDR);
+    Wire.write(0x3B); // Start with register 0x3B (ACCEL_XOUT_H)
+    Wire.endTransmission(false);
+    Wire.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)14, (uint8_t)true); // Request 14 bytes
     
-    // Parse the 12 comma-separated pulses
-    for(int i=0; i<12; i++) {
-      int commaIndex = req.indexOf(',', lastIndex);
-      if(commaIndex != -1) {
-        pulses[i] = req.substring(lastIndex, commaIndex).toInt();
-        lastIndex = commaIndex + 1;
-      } else {
-        pulses[i] = req.substring(lastIndex).toInt();
-      }
-      // Instantly apply to motor
-      pwm.setPWM(servo_pins[i], 0, pulses[i]);
-    }
+    if (Wire.available() == 14) {
+      int16_t acX = Wire.read() << 8 | Wire.read();
+      int16_t acY = Wire.read() << 8 | Wire.read();
+      int16_t acZ = Wire.read() << 8 | Wire.read();
+      int16_t tmp = Wire.read() << 8 | Wire.read(); // Temperature (ignored here)
+      int16_t gyX = Wire.read() << 8 | Wire.read();
+      int16_t gyY = Wire.read() << 8 | Wire.read();
+      int16_t gyZ = Wire.read() << 8 | Wire.read();
 
-    // Immediately read physical response
-    uint16_t raw_enc[12];
-    for(int i=0; i<12; i++) {
-      uint8_t tca = (i < 6) ? TCA_FRONT_ADDR : TCA_BACK_ADDR;
-      uint8_t channel = (i % 6) + 2; 
-      tcaSelect(tca, channel);
-      raw_enc[i] = readAS5600();
+      Serial.print("Accel [X: "); Serial.print(acX);
+      Serial.print(" Y: "); Serial.print(acY);
+      Serial.print(" Z: "); Serial.print(acZ);
+      Serial.print("]  Gyro [X: "); Serial.print(gyX);
+      Serial.print(" Y: "); Serial.print(gyY);
+      Serial.print(" Z: "); Serial.print(gyZ);
+      Serial.println("]");
     }
-
-    // Blast the binary data back to Python
-    uint8_t header[2] = {0xAA, 0xBB};
-    Serial.write(header, 2);
-    Serial.write((uint8_t*)raw_enc, 24);
   }
+  delay(200); // Read 5 times a second for readability in the monitor
 }
