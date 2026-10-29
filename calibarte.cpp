@@ -22,7 +22,7 @@ Adafruit_MPU6050 mpu;
 // --- STATE VARIABLES ---
 int current_joint = 0;              // Tracks which joint we are controlling (0-11)
 int servo_pulses[12];               // Tracks the current pulse value for each servo
-int servo_pins[12] = {0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 15}; // Map to PCA9685 pins
+int servo_pins[12] = {0, 2,4, 5, 6, 7, 8, 9, 10, 12, 13, 15}; // Map to PCA9685 pins
 
 // --- I2C ROUTINES ---
 

@@ -1,126 +1,172 @@
 #include <Arduino.h>
 #include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 
-#define PCA9685_ADDR   0x40
+// --- HARDWARE ADDRESSES ---
 #define TCA_FRONT_ADDR 0x70
 #define TCA_BACK_ADDR  0x71
 #define AS5600_ADDR    0x36
-#define MPU6050_ADDR   0x68 // Default MPU6050 I2C address
 
-bool mpu_found = false;
+// --- OBJECTS ---
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver(0x40);
+Adafruit_MPU6050 mpu;
+
+// --- SERVO CONFIGURATION ---
+#define SERVO_MIN     150 // Minimum pulse length (0 to 4096)
+#define SERVO_MAX     600 // Maximum pulse length (0 to 4096)
+#define SERVO_CENTER  375 // Default center position
+#define STEP_SIZE     10  // How much the servo moves per 'W' or 'S' press
+
+// --- STATE VARIABLES ---
+int current_joint = 0;              // Tracks which joint we are controlling (0-11)
+int servo_pulses[12];               // Tracks the current pulse value for each servo
+int servo_pins[12] = {0, 2,4, 5, 6, 7, 8, 9, 10, 12, 13, 15}; // Map to PCA9685 pins
+
+// --- I2C ROUTINES ---
 
 void tcaSelect(uint8_t target_tca, uint8_t channel) {
   if (channel > 7) return;
+
+  // 1. Identify which TCA we are NOT using right now
   uint8_t idle_tca = (target_tca == TCA_FRONT_ADDR) ? TCA_BACK_ADDR : TCA_FRONT_ADDR;
   
+  // 2. Tell the idle TCA to close all of its channels (send a 0)
   Wire.beginTransmission(idle_tca);
   Wire.write(0); 
   Wire.endTransmission();
 
+  // 3. Tell the target TCA to open the specific channel we want
   Wire.beginTransmission(target_tca);
   Wire.write(1 << channel);
   Wire.endTransmission();
 }
 
-void tcaDisableAll() {
-  Wire.beginTransmission(TCA_FRONT_ADDR);
-  Wire.write(0);
-  Wire.endTransmission();
-  Wire.beginTransmission(TCA_BACK_ADDR);
-  Wire.write(0);
-  Wire.endTransmission();
-}
-
-bool checkDevice(uint8_t address) {
-  Wire.beginTransmission(address);
-  return (Wire.endTransmission() == 0);
-}
-
-void setupMPU6050() {
-  tcaDisableAll(); // Ensure we are talking directly to the main spine
-  Wire.beginTransmission(MPU6050_ADDR);
-  Wire.write(0x6B); // PWR_MGMT_1 register
-  Wire.write(0x00); // Write 0 to wake up the MPU6050
-  Wire.endTransmission();
+uint16_t readAS5600() {
+  Wire.beginTransmission(AS5600_ADDR);
+  Wire.write(0x0E); // Point to the RAW ANGLE register
+  if (Wire.endTransmission(false) != 0) return 0xFFFF; // Sensor offline
+  
+  Wire.requestFrom((uint8_t)AS5600_ADDR, (uint8_t)2);
+  if (Wire.available() == 2) {
+    uint16_t high = Wire.read();
+    uint16_t low = Wire.read();
+    return (high << 8) | low;
+  }
+  return 0xFFFF; 
 }
 
 void setup() {
   Serial.begin(115200);
-  while (!Serial) delay(10);
   
+  // 1. ADD THIS: Wait for you to open the monitor
+  while (!Serial) delay(10); 
+
   Wire.begin();
+  
+  // 2. CHANGE THIS: Drop to 100kHz so the AS5600s don't spike
   Wire.setClock(100000); 
 
-  Serial.println("\n=== V3 PCB DIAGNOSTIC SCANNER ===");
-  Serial.println("Scanning Main I2C Spine...");
+  // 1. Initialize PCA9685
+  pwm.begin();
+  pwm.setOscillatorFrequency(27000000);
+  pwm.setPWMFreq(50);  // Standard analog servos run at 50Hz
 
-  if (checkDevice(PCA9685_ADDR)) Serial.println("[OK] PCA9685 Servo Driver found (0x40)");
-  else Serial.println("[FAIL] PCA9685 missing!");
+  // Center all servos on boot
+  for (int i = 0; i < 12; i++) {
+    servo_pulses[i] = SERVO_CENTER;
+    pwm.setPWM(servo_pins[i], 0, servo_pulses[i]);
+  }
 
-  if (checkDevice(TCA_FRONT_ADDR)) Serial.println("[OK] Front TCA9548A found (0x70)");
-  else Serial.println("[FAIL] Front TCA missing!");
-
-  if (checkDevice(TCA_BACK_ADDR)) Serial.println("[OK] Back TCA9548A found (0x71)");
-  else Serial.println("[FAIL] Back TCA missing!");
-
-  if (checkDevice(MPU6050_ADDR)) {
-    Serial.println("[OK] MPU6050 IMU found (0x68)");
-    mpu_found = true;
-    setupMPU6050();
+  // 2. Initialize IMU
+  if (!mpu.begin()) {
+    Serial.println("WARNING: MPU6050 not detected!");
   } else {
-    Serial.println("[FAIL] MPU6050 missing!");
+    mpu.setAccelerometerRange(MPU6050_RANGE_8_G);
+    mpu.setGyroRange(MPU6050_RANGE_500_DEG);
+    mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
   }
 
-  Serial.println("\nScanning Encoders (Front TCA - 0x70)...");
-  for (uint8_t ch = 0; ch < 8; ch++) {
-    tcaSelect(TCA_FRONT_ADDR, ch);
-    if (checkDevice(AS5600_ADDR)) {
-      Serial.print("  -> Channel "); Serial.print(ch); Serial.println(": [OK] AS5600 Found");
-    } else {
-      Serial.print("  -> Channel "); Serial.print(ch); Serial.println(": Empty");
-    }
-  }
-
-  Serial.println("\nScanning Encoders (Back TCA - 0x71)...");
-  for (uint8_t ch = 0; ch < 8; ch++) {
-    tcaSelect(TCA_BACK_ADDR, ch);
-    if (checkDevice(AS5600_ADDR)) {
-      Serial.print("  -> Channel "); Serial.print(ch); Serial.println(": [OK] AS5600 Found");
-    } else {
-      Serial.print("  -> Channel "); Serial.print(ch); Serial.println(": Empty");
-    }
-  }
-  
-  Serial.println("\nScan Complete. Starting IMU Readout...\n");
-  delay(2000);
+  // 3. Print Menu
+  Serial.println("\n=== QUADRAGON HARDWARE DEBUG ===");
+  Serial.println("[A] / [D] : Select Joint (0-11)");
+  Serial.println("[W] / [S] : Move Selected Servo");
+  Serial.println("[SPACE]   : Re-center Selected Servo");
+  Serial.println("[P]       : Print Joint & IMU Status");
+  Serial.println("================================\n");
 }
 
 void loop() {
-  if (mpu_found) {
-    tcaDisableAll(); // Isolate the main bus for clean IMU reading
-    
-    Wire.beginTransmission(MPU6050_ADDR);
-    Wire.write(0x3B); // Start with register 0x3B (ACCEL_XOUT_H)
-    Wire.endTransmission(false);
-    Wire.requestFrom((uint8_t)MPU6050_ADDR, (uint8_t)14, (uint8_t)true); // Request 14 bytes
-    
-    if (Wire.available() == 14) {
-      int16_t acX = Wire.read() << 8 | Wire.read();
-      int16_t acY = Wire.read() << 8 | Wire.read();
-      int16_t acZ = Wire.read() << 8 | Wire.read();
-      int16_t tmp = Wire.read() << 8 | Wire.read(); // Temperature (ignored here)
-      int16_t gyX = Wire.read() << 8 | Wire.read();
-      int16_t gyY = Wire.read() << 8 | Wire.read();
-      int16_t gyZ = Wire.read() << 8 | Wire.read();
+  // Non-blocking keyboard parser
+  if (Serial.available()) {
+    char c = Serial.read();
 
-      Serial.print("Accel [X: "); Serial.print(acX);
-      Serial.print(" Y: "); Serial.print(acY);
-      Serial.print(" Z: "); Serial.print(acZ);
-      Serial.print("]  Gyro [X: "); Serial.print(gyX);
-      Serial.print(" Y: "); Serial.print(gyY);
-      Serial.print(" Z: "); Serial.print(gyZ);
-      Serial.println("]");
+    // Select Previous Joint
+    if (c == 'a' || c == 'A') {
+      current_joint--;
+      if (current_joint < 0) current_joint = 11;
+      Serial.print(">>> Selected Joint: "); 
+      Serial.println(current_joint);
+    }
+    
+    // Select Next Joint
+    else if (c == 'd' || c == 'D') {
+      current_joint++;
+      if (current_joint > 11) current_joint = 0;
+      Serial.print(">>> Selected Joint: "); 
+      Serial.println(current_joint);
+    }
+
+    // Move Servo Forward
+    else if (c == 'w' || c == 'W') {
+      servo_pulses[current_joint] += STEP_SIZE;
+      if (servo_pulses[current_joint] > SERVO_MAX) servo_pulses[current_joint] = SERVO_MAX;
+      pwm.setPWM(servo_pins[current_joint], 0, servo_pulses[current_joint]);
+      Serial.print("Moved Joint "); Serial.print(current_joint);
+      Serial.print(" -> Pulse: "); Serial.println(servo_pulses[current_joint]);
+    }
+
+    // Move Servo Backward
+    else if (c == 's' || c == 'S') {
+      servo_pulses[current_joint] -= STEP_SIZE;
+      if (servo_pulses[current_joint] < SERVO_MIN) servo_pulses[current_joint] = SERVO_MIN;
+      pwm.setPWM(servo_pins[current_joint], 0, servo_pulses[current_joint]);
+      Serial.print("Moved Joint "); Serial.print(current_joint);
+      Serial.print(" -> Pulse: "); Serial.println(servo_pulses[current_joint]);
+    }
+
+    // Emergency Center
+    else if (c == ' ') {
+      servo_pulses[current_joint] = SERVO_CENTER;
+      pwm.setPWM(servo_pins[current_joint], 0, servo_pulses[current_joint]);
+      Serial.println(">>> Centered Selected Joint!");
+    }
+
+    // Print Telemetry for Selected Joint
+    else if (c == 'p' || c == 'P') {
+      // 1. Route I2C to the correct TCA and Channel
+      uint8_t tca = (current_joint < 6) ? TCA_FRONT_ADDR : TCA_BACK_ADDR;
+      uint8_t channel = (current_joint % 6) + 2; // Assuming sensors are on channels 2-7
+      tcaSelect(tca, channel);
+      
+      // 2. Read Sensor
+      uint16_t enc = readAS5600();
+
+      // 3. Read IMU
+      sensors_event_t a, g, temp;
+      mpu.getEvent(&a, &g, &temp);
+
+      // 4. Print Data
+      Serial.println("\n--- STATUS ---");
+      Serial.print("Target Joint   : "); Serial.println(current_joint);
+      Serial.print("Servo (Pulse)  : "); Serial.println(servo_pulses[current_joint]);
+      Serial.print("AS5600 (Raw)   : "); Serial.println(enc);
+      Serial.print("IMU Accel (XYZ): "); 
+      Serial.print(a.acceleration.x); Serial.print(", ");
+      Serial.print(a.acceleration.y); Serial.print(", ");
+      Serial.println(a.acceleration.z);
+      Serial.println("--------------\n");
     }
   }
-  delay(200); // Read 5 times a second for readability in the monitor
 }
